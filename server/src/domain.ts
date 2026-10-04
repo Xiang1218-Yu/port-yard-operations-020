@@ -1,6 +1,8 @@
 export type ContainerStatus = 'in-transit' | 'at-gate' | 'in-yard' | 'on-quay' | 'released' | 'hold';
 export type EquipmentKind = 'quay-crane' | 'yard-crane' | 'terminal-truck' | 'reach-stacker';
-export type TaskStatus = 'queued' | 'assigned' | 'executing' | 'blocked' | 'done';
+export type TaskStatus = 'queued' | 'assigned' | 'executing' | 'blocked' | 'done' | 'cancelled' | 'failed' | 'merged';
+export type TaskOriginSource = 'gate' | 'vessel-plan' | 'yard-control' | 'manual' | 'dedup';
+export interface TaskOrigin { source: TaskOriginSource; reference?: string; createdAt: string; note?: string; }
 export type AppointmentStatus = 'booked' | 'checked-in' | 'completed' | 'cancelled' | 'exception';
 
 export interface Voyage { id: string; vessel: string; imo: string; service: string; eta: string; etd: string; status: 'approaching' | 'berthed' | 'loading' | 'departed'; berth: string; movesPlanned: number; movesDone: number; lateRisk: 'low' | 'medium' | 'high'; }
@@ -8,10 +10,13 @@ export interface Container { id: string; voyageId: string; size: '20' | '40' | '
 export interface YardBlock { id: string; zone: string; rows: number; tiers: number; capacity: number; occupied: number; reeferPlugs: number; usedPlugs: number; hazmatAllowed: boolean; equipment: EquipmentKind[]; heat: number; }
 export interface GateAppointment { id: string; containerId: string; truckNo: string; driver: string; type: 'pickup' | 'dropoff'; windowStart: string; windowEnd: string; lane: 'north' | 'south' | 'rail'; status: AppointmentStatus; sealVerified: boolean; weightVerified: boolean; exception?: string; }
 export interface Equipment { id: string; name: string; kind: EquipmentKind; status: 'available' | 'working' | 'maintenance' | 'offline'; location: string; battery: number; queue: number; movesPerHour: number; }
-export interface YardTask { id: string; kind: 'receive' | 'deliver' | 'rehandle' | 'load' | 'discharge' | 'inspect'; containerId: string; from: string; to: string; equipmentId?: string; priority: number; status: TaskStatus; scheduledAt: string; blockingReasons: string[]; estimatedMinutes: number; }
+export interface YardTask { id: string; kind: 'receive' | 'deliver' | 'rehandle' | 'load' | 'discharge' | 'inspect'; containerId: string; from: string; to: string; equipmentId?: string; priority: number; status: TaskStatus; scheduledAt: string; blockingReasons: string[]; estimatedMinutes: number; origins?: TaskOrigin[]; mergeGroupId?: string; mergedIntoId?: string; revision?: number; }
 export interface AuditEvent { id: string; actor: string; action: string; entity: string; entityId: string; at: string; details: string; }
 
 const start = Date.now(); const iso = (minutes: number) => new Date(start + minutes * 60000).toISOString();
+let entitySeq = 0;
+/** 同毫秒内连续创建时也保持唯一（Date.now + 单调序列） */
+const nextEntityId = (prefix: string) => `${prefix}-${Date.now()}-${(++entitySeq).toString(36)}`;
 export const voyages: Voyage[] = [
   { id: 'VOY-AX7', vessel: 'MSC Aurora', imo: 'IMO9382014', service: 'AE-3', eta: iso(-90), etd: iso(350), status: 'berthed', berth: 'B07', movesPlanned: 1240, movesDone: 886, lateRisk: 'medium' },
   { id: 'VOY-QF2', vessel: 'Ever Quartz', imo: 'IMO9721103', service: 'TP9', eta: iso(190), etd: iso(890), status: 'approaching', berth: 'B04', movesPlanned: 760, movesDone: 0, lateRisk: 'high' },
@@ -45,11 +50,27 @@ export const equipment: Equipment[] = [
   { id: 'TT-31', name: '集卡 TT-31', kind: 'terminal-truck', status: 'working', location: '南闸口', battery: 61, queue: 2, movesPerHour: 8 },
   { id: 'RS-02', name: '正面吊 RS-02', kind: 'reach-stacker', status: 'maintenance', location: 'D05', battery: 34, queue: 0, movesPerHour: 14 }
 ];
+const manualOrigin = (note: string): TaskOrigin => ({ source: 'manual', createdAt: iso(-30), note });
 export const tasks: YardTask[] = [
-  { id: 'TASK-101', kind: 'deliver', containerId: 'MSCU-4829017', from: 'A01-R07-T3', to: '南闸口', equipmentId: 'YC-12', priority: 92, status: 'assigned', scheduledAt: iso(12), blockingReasons: [], estimatedMinutes: 18 },
-  { id: 'TASK-102', kind: 'rehandle', containerId: 'EISU-1288420', from: 'B07-R03-T2', to: 'D05-R05-T1', equipmentId: 'YC-12', priority: 88, status: 'queued', scheduledAt: iso(24), blockingReasons: ['查验区插件余量接近阈值'], estimatedMinutes: 26 },
-  { id: 'TASK-103', kind: 'inspect', containerId: 'TGHU-9831204', from: 'D05-R02-T1', to: 'D05-R02-T1', priority: 125, status: 'blocked', scheduledAt: iso(4), blockingReasons: ['RS-02 维护中', '待海关查验窗口'], estimatedMinutes: 32 },
-  { id: 'TASK-104', kind: 'load', containerId: 'FCIU-9920310', from: 'C03-R04-T2', to: 'B07 / VOY-QF2', equipmentId: 'YC-05', priority: 75, status: 'queued', scheduledAt: iso(76), blockingReasons: [], estimatedMinutes: 21 }
+  { id: 'TASK-101', kind: 'deliver', containerId: 'MSCU-4829017', from: 'A01-R07-T3', to: '南闸口', equipmentId: 'YC-12', priority: 92, status: 'assigned', scheduledAt: iso(12), blockingReasons: [], estimatedMinutes: 18, origins: [{ source: 'gate', reference: 'APT-9002', createdAt: iso(-28), note: '闸口提箱预约自动派生' }], revision: 1 },
+  { id: 'TASK-102', kind: 'rehandle', containerId: 'EISU-1288420', from: 'B07-R03-T2', to: 'D05-R05-T1', equipmentId: 'YC-12', priority: 88, status: 'queued', scheduledAt: iso(24), blockingReasons: ['查验区插件余量接近阈值'], estimatedMinutes: 26, origins: [manualOrigin('中控按查验计划创建移位任务')], revision: 1 },
+  { id: 'TASK-103', kind: 'inspect', containerId: 'TGHU-9831204', from: 'D05-R02-T1', to: 'D05-R02-T1', priority: 125, status: 'blocked', scheduledAt: iso(4), blockingReasons: ['RS-02 维护中', '待海关查验窗口'], estimatedMinutes: 32, origins: [{ source: 'yard-control', createdAt: iso(-40), note: '海关查验指令' }], revision: 1 },
+  { id: 'TASK-104', kind: 'load', containerId: 'FCIU-9920310', from: 'C03-R04-T2', to: 'B07 / VOY-QF2', equipmentId: 'YC-05', priority: 75, status: 'queued', scheduledAt: iso(76), blockingReasons: [], estimatedMinutes: 21, origins: [{ source: 'vessel-plan', reference: 'VOY-QF2', createdAt: iso(-50), note: '船期装船计划' }], revision: 1 },
+  // —— 同一箱在现场被重复创建的收货 / 移位 / 提箱任务（去重管理模块的演示数据）——
+  { id: 'TASK-201', kind: 'deliver', containerId: 'MSCU-4829017', from: 'A01-R07-T3', to: '南闸口', priority: 60, status: 'queued', scheduledAt: iso(18), blockingReasons: [], estimatedMinutes: 20, origins: [{ source: 'gate', reference: 'APT-9002', createdAt: iso(-6), note: '闸口重复推送提箱计划' }], revision: 1 },
+  { id: 'TASK-202', kind: 'deliver', containerId: 'MSCU-4829017', from: 'A01-R07-T3', to: '北闸口', priority: 55, status: 'queued', scheduledAt: iso(20), blockingReasons: [], estimatedMinutes: 22, origins: [{ source: 'manual', createdAt: iso(-4), note: '现场调度手工补录（闸口方向不同，需人工确认）' }], revision: 1 },
+  { id: 'TASK-203', kind: 'rehandle', containerId: 'EISU-1288420', from: 'B07-R03-T2', to: 'D05-R05-T1', priority: 70, status: 'queued', scheduledAt: iso(30), blockingReasons: [], estimatedMinutes: 26, origins: [{ source: 'yard-control', createdAt: iso(-8), note: '堆场热区重排重复下发移位' }], revision: 1 },
+  { id: 'TASK-204', kind: 'receive', containerId: 'OOLU-7734201', from: '南闸口', to: 'C03-R06-T1', priority: 65, status: 'queued', scheduledAt: iso(2), blockingReasons: [], estimatedMinutes: 15, origins: [{ source: 'gate', reference: 'APT-9001', createdAt: iso(-12), note: '收箱预约派生' }], revision: 1 },
+  { id: 'TASK-205', kind: 'receive', containerId: 'OOLU-7734201', from: '南闸口', to: 'C03-R06-T1', priority: 58, status: 'queued', scheduledAt: iso(6), blockingReasons: [], estimatedMinutes: 15, origins: [{ source: 'manual', createdAt: iso(-3), note: '闸口值班手工重复创建收箱' }], revision: 1 },
+  // —— 替代链与前置链演示：替代任务失败后原任务恢复 ——
+  { id: 'TASK-206', kind: 'deliver', containerId: 'EISU-1288420', from: 'B07-R03-T2', to: '北闸口', priority: 50, status: 'queued', scheduledAt: iso(40), blockingReasons: [], estimatedMinutes: 24, origins: [manualOrigin('初版提箱计划，已被 TASK-207 声明为被替代')], revision: 1 },
+  { id: 'TASK-207', kind: 'deliver', containerId: 'EISU-1288420', from: 'B07-R03-T2', to: '北闸口', equipmentId: 'TT-31', priority: 80, status: 'failed', scheduledAt: iso(38), blockingReasons: ['集卡 TT-31 途中故障'], estimatedMinutes: 24, origins: [{ source: 'yard-control', createdAt: iso(-2), note: '改用集卡直提的替代方案' }], revision: 2 },
+  // —— 前置任务已取消，后置任务的可执行性需要解释 ——
+  { id: 'TASK-208', kind: 'receive', containerId: 'FCIU-9920310', from: '北闸口', to: 'C03-R04-T2', priority: 45, status: 'cancelled', scheduledAt: iso(-10), blockingReasons: [], estimatedMinutes: 14, origins: [{ source: 'gate', createdAt: iso(-20), note: '预约未到场，前置收箱取消' }], revision: 1 },
+  { id: 'TASK-209', kind: 'load', containerId: 'FCIU-9920310', from: 'C03-R04-T2', to: 'B07 / VOY-QF2', priority: 48, status: 'queued', scheduledAt: iso(90), blockingReasons: [], estimatedMinutes: 20, origins: [{ source: 'vessel-plan', reference: 'VOY-QF2', createdAt: iso(-18), note: '依赖 TASK-208 先进场' }], revision: 1 },
+  // —— 同箱同航次但目的地冲突的互斥对（均未开始，保留人工裁决）——
+  { id: 'TASK-210', kind: 'rehandle', containerId: 'TGHU-9831204', from: 'D05-R02-T1', to: 'B07-R11-T1', priority: 52, status: 'queued', scheduledAt: iso(50), blockingReasons: [], estimatedMinutes: 28, origins: [manualOrigin('查验后转回中转区方案 A')], revision: 1 },
+  { id: 'TASK-211', kind: 'rehandle', containerId: 'TGHU-9831204', from: 'D05-R02-T1', to: 'D05-R04-T1', priority: 52, status: 'queued', scheduledAt: iso(52), blockingReasons: [], estimatedMinutes: 28, origins: [manualOrigin('查验后留区方案 B，与方案 A 互斥')], revision: 1 }
 ];
 export const auditEvents: AuditEvent[] = [{ id: 'AUD-500', actor: '中控调度员', action: 'REPLAN', entity: 'voyage', entityId: 'VOY-AX7', at: new Date(start - 20 * 60000).toISOString(), details: '因 QC-07 瞬时降速，重新计算 14 个高优先级作业' }];
 
@@ -83,7 +104,7 @@ export function prioritizeTasks() { return tasks.map(task => ({ ...task, score: 
 export function createAppointment(input: Omit<GateAppointment, 'id' | 'status' | 'sealVerified' | 'weightVerified'>) {
   const container = containers.find(item => item.id === input.containerId); if (!container) throw new Error('箱号不存在');
   if (container.customs !== 'released' && input.type === 'pickup') throw new Error('海关未放行，不能预约提箱');
-  const item: GateAppointment = { ...input, id: `APT-${Date.now()}`, status: 'booked', sealVerified: false, weightVerified: false }; appointments.unshift(item); container.appointmentId = item.id; return item;
+  const item: GateAppointment = { ...input, id: nextEntityId(`APT`), status: 'booked', sealVerified: false, weightVerified: false }; appointments.unshift(item); container.appointmentId = item.id; return item;
 }
 export function updateAppointment(id: string, patch: Partial<Pick<GateAppointment, 'status' | 'sealVerified' | 'weightVerified' | 'exception'>>) { const item = appointments.find(a => a.id === id); if (!item) return undefined; Object.assign(item, patch); const container = containers.find(c => c.id === item.containerId); if (item.status === 'checked-in' && container) container.status = 'at-gate'; if (item.status === 'completed' && container) container.status = item.type === 'pickup' ? 'released' : 'in-yard'; auditEvents.unshift({ id: `AUD-${Date.now()}`, actor: '闸口值班员', action: 'GATE_UPDATE', entity: 'appointment', entityId: id, at: new Date().toISOString(), details: JSON.stringify(patch) }); return item; }
 export function assignTask(id: string, equipmentId: string) { const task = tasks.find(item => item.id === id); const machine = equipment.find(item => item.id === equipmentId); if (!task || !machine) return undefined; const blockingReasons = [...task.blockingReasons]; if (machine.status === 'maintenance' || machine.status === 'offline') blockingReasons.push(`${machine.name} 当前不可用`); if (task.kind === 'inspect' && machine.kind !== 'reach-stacker') blockingReasons.push('查验作业需要正面吊或专用设备'); task.equipmentId = equipmentId; task.status = blockingReasons.length ? 'blocked' : 'assigned'; task.blockingReasons = blockingReasons; auditEvents.unshift({ id: `AUD-${Date.now()}`, actor: '中控调度员', action: 'ASSIGN_TASK', entity: 'yard-task', entityId: id, at: new Date().toISOString(), details: `${equipmentId} -> ${task.containerId}` }); return task; }
@@ -135,8 +156,9 @@ export function deleteContainer(id: string) {
   const removedAppointments = appointments.filter(appointment => appointment.containerId === id);
   for (const appointment of removedAppointments) appointments.splice(appointments.indexOf(appointment), 1);
   const removedTasks = tasks.filter(task => task.containerId === id);
-  for (const task of removedTasks) tasks.splice(tasks.indexOf(task), 1);
-  recordAudit('DELETE', 'container', id, `删除箱务记录，并级联清理 ${removedAppointments.length} 条预约、${removedTasks.length} 条未完成任务`);
+  const taskIds = removedTasks.map(task => task.id);
+  for (const taskId of taskIds) deleteYardTask(taskId);
+  recordAudit('DELETE', 'container', id, `删除箱务记录，并级联清理 ${removedAppointments.length} 条预约、${taskIds.length} 条未完成任务`);
   return item;
 }
 
@@ -145,7 +167,7 @@ export function createGateAppointment(input: AppointmentInput) {
   if (!container) throw new Error('箱号不存在');
   if (input.type === 'pickup' && container.customs !== 'released') throw new Error('海关未放行，不能预约提箱');
   if (new Date(input.windowEnd) <= new Date(input.windowStart)) throw new Error('预约结束时间必须晚于开始时间');
-  const item: GateAppointment = { ...input, id: `APT-${Date.now()}`, status: 'booked', sealVerified: false, weightVerified: false };
+  const item: GateAppointment = { ...input, id: nextEntityId(`APT`), status: 'booked', sealVerified: false, weightVerified: false };
   appointments.unshift(item);
   container.appointmentId = item.id;
   recordAudit('CREATE', 'appointment', item.id, `为 ${item.containerId} 创建闸口预约`);
@@ -182,7 +204,7 @@ export function createYardTask(input: TaskInput) {
   if (!containers.some(container => container.id === input.containerId)) throw new Error('关联箱号不存在');
   if (input.priority < 1 || input.priority > 100) throw new Error('优先级范围为 1–100');
   if (input.estimatedMinutes <= 0) throw new Error('预计作业时长必须大于 0');
-  const item: YardTask = { ...input, id: `TASK-${Date.now()}`, status: input.equipmentId ? 'assigned' : 'queued', blockingReasons: [], scheduledAt: input.scheduledAt };
+  const item: YardTask = { ...input, id: nextEntityId(`TASK`), status: input.equipmentId ? 'assigned' : 'queued', blockingReasons: [], scheduledAt: input.scheduledAt, origins: [{ source: 'manual', createdAt: new Date().toISOString(), note: '任务队列手工创建' }], revision: 1 };
   tasks.unshift(item);
   recordAudit('CREATE', 'yard-task', item.id, `创建 ${input.kind} 任务，关联 ${input.containerId}`);
   return item;
@@ -192,8 +214,10 @@ export function updateYardTask(id: string, patch: Partial<TaskInput & Pick<YardT
   const item = tasks.find(task => task.id === id);
   if (!item) return undefined;
   if (patch.containerId && !containers.some(container => container.id === patch.containerId)) throw new Error('关联箱号不存在');
+  if (patch.containerId && patch.containerId !== item.containerId) taskHooks.beforeRebind?.(id, patch.containerId);
   if (patch.priority !== undefined && (patch.priority < 1 || patch.priority > 100)) throw new Error('优先级范围为 1–100');
   Object.assign(item, patch);
+  item.revision = (item.revision ?? 1) + 1;
   recordAudit('UPDATE', 'yard-task', id, `更新场内作业任务：${JSON.stringify(patch)}`);
   return item;
 }
@@ -201,7 +225,17 @@ export function updateYardTask(id: string, patch: Partial<TaskInput & Pick<YardT
 export function deleteYardTask(id: string) {
   const index = tasks.findIndex(item => item.id === id);
   if (index < 0) return undefined;
+  taskHooks.beforeDelete?.(id);
   const [item] = tasks.splice(index, 1);
   recordAudit('DELETE', 'yard-task', id, `删除 ${item.containerId} 的场内任务`);
   return item;
 }
+
+// 依赖/去重模块（planner.ts）通过钩子在任务删除、改挂箱号前做一致性保护，
+// 使用注册点而不是直接 import，避免 domain ↔ planner 循环依赖。
+export interface TaskLifecycleHooks {
+  beforeDelete?: (id: string) => void;
+  beforeRebind?: (id: string, nextContainerId: string) => void;
+}
+let taskHooks: TaskLifecycleHooks = {};
+export function registerTaskLifecycleHooks(hooks: TaskLifecycleHooks) { taskHooks = hooks; }
