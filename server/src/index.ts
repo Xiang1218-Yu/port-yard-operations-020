@@ -1,5 +1,5 @@
 import express from 'express';
-import { appointments, assignTask, blocks, containerDetail, containers, createContainer, createGateAppointment, createYardTask, dashboard, deleteContainer, deleteGateAppointment, deleteYardTask, editGateAppointment, equipment, gateConflicts, prioritizeTasks, tasks, updateContainer, updateYardTask, voyages, yardHeatmap } from './domain.js';
+import { appointments, auditEvents, blocks, containerDetail, containers, createContainer, createGateAppointment, createYardTask, dashboard, declareTaskRelation, deleteContainer, deleteGateAppointment, deleteYardTask, editGateAppointment, equipment, gateConflicts, mergeDuplicateTasks, prioritizeTasks, assignTask, taskDetail, taskGraphSnapshot, transitionTask, updateContainer, updateYardTask, voyages, yardHeatmap } from './domain.js';
 const app = express(); app.use(express.json());
 app.get('/api/dashboard', (_req, res) => res.json(dashboard()));
 app.get('/api/voyages', (_req, res) => res.json(voyages));
@@ -16,10 +16,17 @@ app.post('/api/gate/appointments', (req, res) => { try { res.status(201).json(cr
 app.patch('/api/gate/appointments/:id', (req, res) => { try { const result = editGateAppointment(req.params.id, req.body); if (!result) return res.status(404).json({ message: '预约不存在' }); res.json(result); } catch (error) { res.status(409).json({ message: error instanceof Error ? error.message : '更新预约失败' }); } });
 app.delete('/api/gate/appointments/:id', (req, res) => { const result = deleteGateAppointment(req.params.id); if (!result) return res.status(404).json({ message: '预约不存在' }); res.json({ deleted: true, id: result.id }); });
 app.get('/api/equipment', (_req, res) => res.json(equipment));
+app.get('/api/audit', (_req, res) => res.json(auditEvents));
+app.get('/api/task-graph', (_req, res) => res.json(taskGraphSnapshot()));
 app.get('/api/tasks', (_req, res) => res.json(prioritizeTasks()));
+app.get('/api/tasks/:id/detail', (req, res) => { const result = taskDetail(req.params.id); if (!result) return res.status(404).json({ message: '作业任务不存在' }); res.json(result); });
+app.post('/api/task-relations', (req, res) => { try { res.status(201).json(declareTaskRelation(req.body)); } catch (error) { res.status(error instanceof Error && error.message.includes('版本') ? 409 : 400).json({ message: error instanceof Error ? error.message : '关系声明失败' }); } });
+app.post('/api/tasks/:id/merge', (req, res) => { try { res.status(201).json(mergeDuplicateTasks({ ...req.body, survivorTaskId: req.params.id })); } catch (error) { res.status(error instanceof Error && error.message.includes('版本') ? 409 : 400).json({ message: error instanceof Error ? error.message : '合并失败' }); } });
+app.patch('/api/tasks/:id/transition', (req, res) => { try { res.json(transitionTask(req.params.id, req.body)); } catch (error) { res.status(error instanceof Error && error.message.includes('版本') ? 409 : 400).json({ message: error instanceof Error ? error.message : '状态流转失败' }); } });
+app.patch('/api/tasks/:id/reassign', (req, res) => { try { res.json(assignTask(req.params.id, req.body)); } catch (error) { res.status(error instanceof Error && error.message.includes('版本') ? 409 : 400).json({ message: error instanceof Error ? error.message : '设备重新指派失败' }); } });
 app.post('/api/tasks', (req, res) => { try { res.status(201).json(createYardTask(req.body)); } catch (error) { res.status(409).json({ message: error instanceof Error ? error.message : '创建作业任务失败' }); } });
 app.patch('/api/tasks/:id', (req, res) => { try { const result = updateYardTask(req.params.id, req.body); if (!result) return res.status(404).json({ message: '作业任务不存在' }); res.json(result); } catch (error) { res.status(409).json({ message: error instanceof Error ? error.message : '更新作业任务失败' }); } });
-app.delete('/api/tasks/:id', (req, res) => { const result = deleteYardTask(req.params.id); if (!result) return res.status(404).json({ message: '作业任务不存在' }); res.json({ deleted: true, id: result.id }); });
-app.patch('/api/tasks/:id/assign', (req, res) => { const result = assignTask(req.params.id, req.body.equipmentId); if (!result) return res.status(404).json({ message: '任务或设备不存在' }); res.json(result); });
+app.delete('/api/tasks/:id', (req, res) => { try { const result = deleteYardTask(req.params.id); if (!result) return res.status(404).json({ message: '作业任务不存在' }); res.json({ deleted: true, id: result.id }); } catch (error) { res.status(409).json({ message: error instanceof Error ? error.message : '删除作业失败' }); } });
+app.patch('/api/tasks/:id/assign', (req, res) => { try { res.json(assignTask(req.params.id, { ...req.body, expectedVersion: req.body.expectedVersion ?? taskGraphSnapshot().version })); } catch (error) { res.status(error instanceof Error && error.message.includes('版本') ? 409 : 400).json({ message: error instanceof Error ? error.message : '设备指派失败' }); } });
 app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'port-yard-operations' }));
 const port = Number(process.env.PORT || 4107); app.listen(port, () => console.log(`port yard API listening on ${port}`));
